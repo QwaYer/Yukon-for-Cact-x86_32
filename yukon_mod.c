@@ -9,30 +9,26 @@
 const uint16_t cact_pci_vendor_id = MARVELL_VENDOR_ID;
 const uint16_t cact_pci_device_ids[] = {MARVELL_YUKON_88E8040_DID, 0};
 
-extern void kprint(char *s);
-extern void kprint_hex(uint32_t v);
-extern void klog(int level, const char *message);
-extern uint32_t pci_read32(uint8_t bus, uint8_t dev, uint8_t fn, uint8_t reg);
-extern void pci_write32(uint8_t bus, uint8_t dev, uint8_t fn, uint8_t reg, uint32_t val);
+extern void printk(const char *fmt, ...);
+extern void printk_hex(uint32_t v);
+
+extern uint32_t pci_read_config_dword(uint8_t bus, uint8_t dev, uint8_t fn, uint8_t reg);
+extern void pci_write_config_dword(uint8_t bus, uint8_t dev, uint8_t fn, uint8_t reg, uint32_t val);
 extern void *memset(void *s, int c, size_t n);
 extern void *memcpy(void *dst, const void *src, size_t n);
-extern void net_register_driver(net_driver_t *drv);
-extern void net_unregister_driver(net_driver_t *drv);
+extern void register_netdev(net_driver_t *drv);
+extern void unregister_netdev(net_driver_t *drv);
 extern net_driver_t *active_nic;
 extern void vmm_map(uint32_t *pd, uint32_t virt, uint32_t phys, int flags);
 extern skb_t *skb_alloc(void);
-extern void skb_free(skb_t *skb);
+extern void kfree_skb(skb_t *skb);
 extern uint8_t *skb_put(skb_t *skb, uint16_t len);
 extern uint8_t *skb_data(skb_t *skb);
 extern uint16_t skb_len(skb_t *skb);
-extern void net_receive(skb_t *skb);
+extern void netif_rx(skb_t *skb);
 extern void *kmalloc_aligned(uint32_t size, uint32_t align);
-extern void kfree_aligned(void *p);
+extern void kfree(void *p);
 
-#define KLOG_OK    0
-#define KLOG_WARN  1
-#define KLOG_ERROR 2
-#define KLOG_FAIL  3
 
 typedef struct {
     uint8_t bus;
@@ -322,7 +318,7 @@ static int yukon_send_stub(skb_t *skb) {
                 g_tx_le[g_yukon.tx_put].opcode = (uint8_t)(OP_PACKET | HW_OWNER);
                 g_yukon.tx_put = next;
                 yukon_mmio_write16(Y2_QADDR(Q_XA1, PREF_UNIT_PUT_IDX), g_yukon.tx_put);
-                skb_free(skb);
+                kfree_skb(skb);
                 return 0;
             }
         }
@@ -336,20 +332,20 @@ static int yukon_send_stub(skb_t *skb) {
 
     len = skb_len(skb);
     if (len == 0 || len > (uint16_t)sizeof(g_sw_q[0].buf)) {
-        skb_free(skb);
+        kfree_skb(skb);
         return -1;
     }
 
     next = (uint16_t)((g_sw_q_head + 1u) % YUKON_SW_LOOP_Q);
     if (next == g_sw_q_tail) {
-        skb_free(skb);
+        kfree_skb(skb);
         return -1;
     }
 
     g_sw_q[g_sw_q_head].len = len;
     memcpy(g_sw_q[g_sw_q_head].buf, skb_data(skb), len);
     g_sw_q_head = next;
-    skb_free(skb);
+    kfree_skb(skb);
     return 0;
 }
 
@@ -373,9 +369,9 @@ static void yukon_poll_stub(void) {
                     uint8_t *dst = skb_put(skb, length);
                     if (dst) {
                         memcpy(dst, g_rx_bufs[g_yukon.rx_cons], length);
-                        net_receive(skb);
+                        netif_rx(skb);
                     } else {
-                        skb_free(skb);
+                        kfree_skb(skb);
                     }
                 }
                 g_rx_le[g_yukon.rx_cons].addr = (uint32_t)(uintptr_t)g_rx_bufs[g_yukon.rx_cons];
@@ -400,11 +396,11 @@ static void yukon_poll_stub(void) {
             break;
         dst = skb_put(skb, len);
         if (!dst) {
-            skb_free(skb);
+            kfree_skb(skb);
             break;
         }
         memcpy(dst, g_sw_q[g_sw_q_tail].buf, len);
-        net_receive(skb);
+        netif_rx(skb);
         g_sw_q_tail = (uint16_t)((g_sw_q_tail + 1u) % YUKON_SW_LOOP_Q);
     }
 
@@ -442,8 +438,8 @@ static void yukon_detach(void) {
     if (!g_yukon.attached)
         return;
 
-    net_unregister_driver(&g_yukon_driver);
-    pci_write32(g_yukon.bus, g_yukon.dev, g_yukon.fn, 0x04, g_yukon.saved_pci_cmd);
+    unregister_netdev(&g_yukon_driver);
+    pci_write_config_dword(g_yukon.bus, g_yukon.dev, g_yukon.fn, 0x04, g_yukon.saved_pci_cmd);
     g_yukon.attached = 0;
     g_prev_nic = NULL;
     g_yukon.mmio_base = 0;
@@ -452,38 +448,38 @@ static void yukon_detach(void) {
     g_yukon.native_tx_ok = 0;
     g_yukon.native_rx_ok = 0;
     if (g_tx_le) {
-        kfree_aligned(g_tx_le);
+        kfree(g_tx_le);
         g_tx_le = NULL;
     }
     {
         uint32_t i;
         for (i = 0; i < YUKON_TX_RING_SIZE; i++) {
             if (g_tx_bufs[i]) {
-                kfree_aligned(g_tx_bufs[i]);
+                kfree(g_tx_bufs[i]);
                 g_tx_bufs[i] = NULL;
             }
         }
     }
     if (g_rx_le) {
-        kfree_aligned(g_rx_le);
+        kfree(g_rx_le);
         g_rx_le = NULL;
     }
     {
         uint32_t i;
         for (i = 0; i < YUKON_TX_RING_SIZE; i++) {
             if (g_rx_bufs[i]) {
-                kfree_aligned(g_rx_bufs[i]);
+                kfree(g_rx_bufs[i]);
                 g_rx_bufs[i] = NULL;
             }
         }
     }
     if (g_st_le) {
-        kfree_aligned(g_st_le);
+        kfree(g_st_le);
         g_st_le = NULL;
     }
     g_sw_q_head = 0;
     g_sw_q_tail = 0;
-    klog(KLOG_OK, "yukon (kmod): detached");
+    printk("6" "yukon (kmod): detached");
 }
 
 int pci_driver_probe(pci_device_t *pdev) {
@@ -512,12 +508,12 @@ int pci_driver_probe(pci_device_t *pdev) {
     else if (!pdev->bars[1].is_io && pdev->bars[1].base)
         yukon_map_mmio(pdev->bars[1].base);
 
-    cmd32 = pci_read32(pdev->bus, pdev->dev, pdev->fn, 0x04);
+    cmd32 = pci_read_config_dword(pdev->bus, pdev->dev, pdev->fn, 0x04);
     g_yukon.saved_pci_cmd = cmd32;
     cmd16 = (uint16_t)(cmd32 & 0xFFFFu);
     cmd16 |= (PCI_CMD_MEM_SPACE | PCI_CMD_BUS_MASTER);
     cmd16 &= (uint16_t)~PCI_CMD_INTX_DISABLE;
-    pci_write32(pdev->bus, pdev->dev, pdev->fn, 0x04, (cmd32 & 0xFFFF0000u) | cmd16);
+    pci_write_config_dword(pdev->bus, pdev->dev, pdev->fn, 0x04, (cmd32 & 0xFFFF0000u) | cmd16);
 
     if (yukon_read_hw_mac(g_yukon.mac) == 0)
         g_yukon.native_mac_ok = 1;
@@ -540,41 +536,41 @@ int pci_driver_probe(pci_device_t *pdev) {
     } else {
         memset(&g_yukon_driver.mac, 0, sizeof(g_yukon_driver.mac));
     }
-    net_register_driver(&g_yukon_driver);
+    register_netdev(&g_yukon_driver);
     g_yukon.attached = 1;
 
-    kprint("[yukon mod] attached ");
-    kprint_hex(pdev->vendor_id);
-    kprint(":");
-    kprint_hex(pdev->device_id);
-    kprint(" bus=");
-    kprint_hex(pdev->bus);
-    kprint(" dev=");
-    kprint_hex(pdev->dev);
-    kprint(" fn=");
-    kprint_hex(pdev->fn);
-    kprint(" mmio=");
-    kprint_hex(g_yukon.mmio_base);
+    printk("[yukon mod] attached ");
+    printk_hex(pdev->vendor_id);
+    printk(":");
+    printk_hex(pdev->device_id);
+    printk(" bus=");
+    printk_hex(pdev->bus);
+    printk(" dev=");
+    printk_hex(pdev->dev);
+    printk(" fn=");
+    printk_hex(pdev->fn);
+    printk(" mmio=");
+    printk_hex(g_yukon.mmio_base);
     if (g_yukon.native_mac_ok) {
-        kprint(" mac=");
-        kprint_hex(g_yukon.mac[0]); kprint(":");
-        kprint_hex(g_yukon.mac[1]); kprint(":");
-        kprint_hex(g_yukon.mac[2]); kprint(":");
-        kprint_hex(g_yukon.mac[3]); kprint(":");
-        kprint_hex(g_yukon.mac[4]); kprint(":");
-        kprint_hex(g_yukon.mac[5]);
+        printk(" mac=");
+        printk_hex(g_yukon.mac[0]); printk(":");
+        printk_hex(g_yukon.mac[1]); printk(":");
+        printk_hex(g_yukon.mac[2]); printk(":");
+        printk_hex(g_yukon.mac[3]); printk(":");
+        printk_hex(g_yukon.mac[4]); printk(":");
+        printk_hex(g_yukon.mac[5]);
     }
-    kprint("\n");
+    printk("\n");
     if (g_yukon.native_tx_ok && g_yukon.native_rx_ok)
-        klog(KLOG_WARN, "yukon (kmod): experimental native TX/RX polling mode");
+        printk("4" "yukon (kmod): experimental native TX/RX polling mode");
     else if (g_yukon.native_tx_ok && g_prev_nic)
-        klog(KLOG_WARN, "yukon (kmod): native-TX + passthrough/loopback RX mode");
+        printk("4" "yukon (kmod): native-TX + passthrough/loopback RX mode");
     else if (g_yukon.native_tx_ok)
-        klog(KLOG_WARN, "yukon (kmod): native-TX + standalone loopback RX mode");
+        printk("4" "yukon (kmod): native-TX + standalone loopback RX mode");
     else if (g_prev_nic)
-        klog(KLOG_WARN, "yukon (kmod): passthrough+loopback mode; native Yukon RX/TX still TODO");
+        printk("4" "yukon (kmod): passthrough+loopback mode; native Yukon RX/TX still TODO");
     else
-        klog(KLOG_WARN, "yukon (kmod): standalone loopback mode; native Yukon RX/TX still TODO");
+        printk("4" "yukon (kmod): standalone loopback mode; native Yukon RX/TX still TODO");
     return 0;
 }
 
